@@ -55,6 +55,7 @@ const float ACC_NORMALIZE_FACT = 1.0/16400.0;
 const int8_t MY_VOLUME = 11;
 
 int8_t state = 0;
+bool battery_voltage_low = false;
 int16_t timeout_counter = 0;
 
 // implement a notification class,
@@ -119,7 +120,7 @@ SoftwareSerial secondarySerial(10, 11); // RX, TX
 DFMiniMp3<SoftwareSerial, Mp3Notify> mp3(secondarySerial);
 
 uint8_t prev_track_num = 99;
-void playSide(uint8_t side) { // side 0..5
+void playSide(uint8_t side) { // side 0..5; 6 reserved for low voltage
   timeout_counter = 0;
   
   //mp3.playMp3FolderTrack(1); // sd:/mp3/0001*.mp3
@@ -144,6 +145,24 @@ void playSide(uint8_t side) { // side 0..5
   mp3.playFolderTrack16(folder, track); // sd:/01/0001.*.mp3  this is for older chips = my chip
 }
 
+int getAccurateVoltage() {
+  getVoltage(); // first read is reported to be too low, second one is accurate, apparently
+  return getVoltage();
+}
+
+// Read the voltage of the battery the Arduino is currently running on (in millivolts)
+int getVoltage(void) {
+  const long InternalReferenceVoltage = 1091L; // Adjust this value to your boards specific internal BG voltage x1000
+  #if defined(AVR_ATmega1280) || defined(AVR_ATmega2560) // For mega boards
+    ADMUX = (0<<REFS1) | (1<<REFS0) | (0<<ADLAR) | (0<<MUX5) | (1<<MUX4) | (1<<MUX3) | (1<<MUX2) | (1<<MUX1) | (0<<MUX0);
+  #else // For 168/328 boards
+    ADMUX = (0<<REFS1) | (1<<REFS0) | (0<<ADLAR) | (1<<MUX3) | (1<<MUX2) | (1<<MUX1) | (0<<MUX0);
+  #endif
+  ADCSRA |= _BV( ADSC ); // Start a conversion 
+  while( ( (ADCSRA & (1<<ADSC)) != 0 ) ); // Wait for it to complete
+  int results = (((InternalReferenceVoltage * 1024L) / ADC) + 5L) / 10L; // Scale the value; calculates for straight line value
+  return results*10; // convert from centivolts to millivolts
+}
 
 void setup(){
   Wire.begin();
@@ -186,81 +205,92 @@ void loop() {
     Serial.println("timeout, start playing new song");
     state = 99; // restart playing a song
   }
-  // also check for state every about 3 seconds
+  // also check for mp3 player state and battery voltage every about 3 seconds
   if (timeout_counter % 20 == 0) {
     if (mp3.getStatus() != 513) { // 513 means playing, 512 means finished/not playing
       Serial.println("not playing (error?), start playing new song");
       state = 99;
     }
+
+    //Serial.println(getAccurateVoltage());
+    if (!battery_voltage_low && (getAccurateVoltage() < 3300)) {
+      battery_voltage_low = true;
+    }
   }
+
+  if (battery_voltage_low) {
+    if (state != 6) {
+      state = 6;
+      playSide(state);
+    }
+  } else {
+    Wire.beginTransmission(MPU_addr);
+    Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
+    Wire.endTransmission(false);
   
-  Wire.beginTransmission(MPU_addr);
-  Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
-  Wire.endTransmission(false);
-
-  Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
-  AcX=Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)     
-  AcY=Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
-  AcZ=Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
-  Tmp=Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
-  GyX=Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
-  GyY=Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
-  GyZ=Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
-
-  //Wire.requestFrom(MPU_addr,6,true);  // request a total of 6 registers
-  //AcX=Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)     
-  //AcY=Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
-  //AcZ=Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
-
-  ac_x = (AcX - ACC_X_BIAS) * ACC_NORMALIZE_FACT;
-  ac_y = (AcY - ACC_Y_BIAS) * ACC_NORMALIZE_FACT;
-  ac_z = (AcZ - ACC_Z_BIAS) * ACC_NORMALIZE_FACT;
-
-  //Serial.print(millis()); Serial.print(",");
-  #ifdef DEBUG_OUTPUT
-  Serial.print(ac_x); Serial.print(",");
-  Serial.print(ac_y); Serial.print(",");
-  Serial.println(ac_z);
-  #endif
-  //Serial.print("AcX="); Serial.print(AcX);
-  //Serial.print(" AcY="); Serial.print(AcY);
-  //Serial.print(" AcZ="); Serial.print(AcZ);
-  //Serial.print(" Tmp="); Serial.print(Tmp/340.00+36.53);  //equation for temperature in degrees C from datasheet
-  //Serial.print(" GyX="); Serial.print(GyX);
-  //Serial.print(" GyY="); Serial.print(GyY);
-  //Serial.print(" GyZ="); Serial.println(GyZ);
-
-  //if (AcX > 0) digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
-  //  else digitalWrite(LED_BUILTIN, LOW);
-
-  mp3.setVolume(MY_VOLUME); // 0-30
-
-  if ((state != 0) && (ac_x > 0.8)) {
-    state = 0;
-    playSide(state);
+    Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
+    AcX=Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)     
+    AcY=Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+    AcZ=Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+    Tmp=Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
+    GyX=Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
+    GyY=Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
+    GyZ=Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+  
+    //Wire.requestFrom(MPU_addr,6,true);  // request a total of 6 registers
+    //AcX=Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)     
+    //AcY=Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+    //AcZ=Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+  
+    ac_x = (AcX - ACC_X_BIAS) * ACC_NORMALIZE_FACT;
+    ac_y = (AcY - ACC_Y_BIAS) * ACC_NORMALIZE_FACT;
+    ac_z = (AcZ - ACC_Z_BIAS) * ACC_NORMALIZE_FACT;
+  
+    //Serial.print(millis()); Serial.print(",");
+    #ifdef DEBUG_OUTPUT
+    Serial.print(ac_x); Serial.print(",");
+    Serial.print(ac_y); Serial.print(",");
+    Serial.println(ac_z);
+    #endif
+    //Serial.print("AcX="); Serial.print(AcX);
+    //Serial.print(" AcY="); Serial.print(AcY);
+    //Serial.print(" AcZ="); Serial.print(AcZ);
+    //Serial.print(" Tmp="); Serial.print(Tmp/340.00+36.53);  //equation for temperature in degrees C from datasheet
+    //Serial.print(" GyX="); Serial.print(GyX);
+    //Serial.print(" GyY="); Serial.print(GyY);
+    //Serial.print(" GyZ="); Serial.println(GyZ);
+  
+    //if (AcX > 0) digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+    //  else digitalWrite(LED_BUILTIN, LOW);
+  
+    mp3.setVolume(MY_VOLUME); // 0-30
+  
+    if ((state != 0) && (ac_x > 0.8)) {
+      state = 0;
+      playSide(state);
+    }
+    if ((state != 1) && (ac_x < -0.8)) {
+      state = 1;
+      playSide(state);
+    }
+  
+    if ((state != 2) && (ac_y > 0.8)) {
+      state = 2;
+      playSide(state);
+    }
+    if ((state != 3) && (ac_y < -0.8)) {
+      state = 3;
+      playSide(state);
+    }
+    if ((state != 4) && (ac_z > 0.8)) {
+      state = 4;
+      playSide(state);
+    }
+    if ((state != 5) && (ac_z < -0.8)) {
+      state = 5;
+      playSide(state);
+    }
   }
-  if ((state != 1) && (ac_x < -0.8)) {
-    state = 1;
-    playSide(state);
-  }
-
-  if ((state != 2) && (ac_y > 0.8)) {
-    state = 2;
-    playSide(state);
-  }
-  if ((state != 3) && (ac_y < -0.8)) {
-    state = 3;
-    playSide(state);
-  }
-  if ((state != 4) && (ac_z > 0.8)) {
-    state = 4;
-    playSide(state);
-  }
-  if ((state != 5) && (ac_z < -0.8)) {
-    state = 5;
-    playSide(state);
-  }
-
 
   mp3.loop(); 
 
